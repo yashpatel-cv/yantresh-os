@@ -13,11 +13,25 @@ by a tool that phones an LLM itself, §A.1#3).
 from __future__ import annotations
 
 import inspect
+import os
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, get_type_hints
+
+# Demo-lane capability fence: comma-separated tool names. Unset/empty =
+# full registry (the default, private-lane behavior). Read fresh on
+# every call — set once by the supervisor process before exec'ing the
+# subprocess, never mutated at runtime. (Config.demo / api.py)
+_ALLOWLIST_ENV = "YANTRESH_TOOL_ALLOWLIST"
+
+
+def _allowed_names() -> set[str] | None:
+    raw = os.environ.get(_ALLOWLIST_ENV, "").strip()
+    if not raw:
+        return None
+    return {name.strip() for name in raw.split(",") if name.strip()}
 
 
 class ToolError(Exception):
@@ -91,6 +105,7 @@ def tool(fn: Callable[..., str]) -> Callable[..., str]:
 
 
 def openai_schemas() -> list[dict[str, Any]]:
+    allowed = _allowed_names()
     return [
         {
             "type": "function",
@@ -101,11 +116,18 @@ def openai_schemas() -> list[dict[str, Any]]:
             },
         }
         for spec in REGISTRY.values()
+        if allowed is None or spec.name in allowed
     ]
 
 
 def execute(name: str, args: dict[str, Any]) -> str:
     """Run a registered tool. Returns raw output; the agent quarantines it."""
+    allowed = _allowed_names()
+    if allowed is not None and name not in allowed:
+        # Defense in depth: even if a worker calls a tool outside its
+        # advertised schema (hallucination, injected instruction), the
+        # capability fence holds at execution time too.
+        raise ToolError(f"tool {name!r} is not permitted in this run (demo allowlist)")
     spec = REGISTRY.get(name)
     if spec is None:
         raise ToolError(f"unknown tool: {name!r}")
@@ -149,29 +171,4 @@ def read_file(path: str) -> str:
 def write_file(path: str, content: str) -> str:
     """Write UTF-8 text to a file in the workspace, creating parent dirs."""
     target = _jail(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
-    return f"wrote {len(content)} chars to {path}"
-
-
-@tool
-def run_bash(command: str) -> str:
-    """Run a shell command inside the workspace (20s timeout, no network)."""
-    for pattern in _BASH_BLOCKLIST:
-        if pattern.search(command):
-            raise ToolError(f"command blocked by security policy: {command!r}")
-    if _WORKDIR is None:
-        raise ToolError("tools not configured")
-    try:
-        proc = subprocess.run(
-            command,
-            shell=True,
-            cwd=_WORKDIR,
-            capture_output=True,
-            text=True,
-            timeout=_BASH_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise ToolError(f"command timed out after {_BASH_TIMEOUT}s") from exc
-    output = (proc.stdout or "") + (("\n[stderr]\n" + proc.stderr) if proc.stderr else "")
-    return f"[exit {proc.returncode}]\n{output.strip() or '(no output)'}"
+    target.parent.m
