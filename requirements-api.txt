@@ -1,0 +1,6 @@
+# API runtime — superset of requirements.txt, isolated so the CLI-only
+# install path (requirements.txt) stays minimal (Zero Bloat).
+-r requirements.txt
+
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
