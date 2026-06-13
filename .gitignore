@@ -1,0 +1,17 @@
+# environment
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# runtime state (ledger journal + cost fuse — never committed)
+.yantresh/
+
+# OS
+.DS_Store
+Thumbs.db
