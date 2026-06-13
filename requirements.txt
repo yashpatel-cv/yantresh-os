@@ -1,0 +1,5 @@
+# runtime
+litellm>=1.61
+
+# development
+pytest>=8.0
