@@ -74,7 +74,10 @@ def extract_json(text: str) -> dict[str, Any]:
         pass
     start, end = text.find("{"), text.rfind("}")
     if start != -1 and end > start:
-        parsed = json.loads(text[start : end + 1])
+        try:
+            parsed = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            parsed = None
         if isinstance(parsed, dict):
             return parsed
     raise ValueError(f"no JSON object in model output: {text[:120]!r}")
@@ -302,14 +305,22 @@ class Agent:
                 assert_descent(prev, self._b.variant(**vbase, iters=iters))
 
                 name = call["function"]["name"]
+                raw_args = call["function"]["arguments"] or "{}"
                 try:
-                    args = json.loads(call["function"]["arguments"] or "{}")
-                except json.JSONDecodeError:
+                    args = json.loads(raw_args)
+                    if not isinstance(args, dict):
+                        raise ValueError("arguments JSON is not an object")
+                except (json.JSONDecodeError, ValueError):
+                    # Surface the malformed-JSON cause directly rather than
+                    # silently substituting {} and letting it look like a
+                    # generic "missing arguments" tool error.
                     args = {}
-                try:
-                    raw = toolbox.execute(name, args)
-                except ToolError as exc:
-                    raw = f"TOOL ERROR: {exc}"
+                    raw = f"TOOL ERROR: malformed arguments for {name}: {raw_args[:200]!r} is not valid JSON"
+                else:
+                    try:
+                        raw = toolbox.execute(name, args)
+                    except ToolError as exc:
+                        raw = f"TOOL ERROR: {exc}"
 
                 if guard.looping(name, args, raw):
                     return f"BLOCKED: loop detected — {name} repeating with identical results"
