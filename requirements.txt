@@ -1,5 +1,5 @@
 # runtime
-litellm>=1.61
+litellm>=1.61,<2
 
 # development
-pytest>=8.0
+pytest>=8.0,<9
