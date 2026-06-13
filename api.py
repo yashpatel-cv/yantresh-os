@@ -44,12 +44,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 from bounds import Bounds, Escalate
-from config import Config, load_config
+from config import BudgetCfg, Config, load_config
 from ledger import Ledger
 
 APP_DIR = Path(__file__).resolve().parent
@@ -60,6 +61,13 @@ MAX_CONCURRENT_DEMO_MISSIONS = max(1, int(os.environ.get("YANTRESH_MAX_DEMO_CONC
 MAX_MISSION_RECORDS = 500           # bounded in-memory job table (Zero Bloat: no Redis)
 MISSION_TTL_SECONDS = int(os.environ.get("YANTRESH_MISSION_TTL_SECONDS", "3600"))
 SUBPROCESS_GRACE_SECONDS = 15        # slack added to bounds.max_seconds before SIGKILL
+
+# Public demo lane: per-IP request cap, independent of (and tighter than)
+# the cost fuse — the fuse protects spend, this protects the mission table
+# and subprocess pool from a single client flooding /v1/demo/missions.
+# 0 disables the limiter.
+DEMO_RATE_LIMIT_PER_MIN = max(0, int(os.environ.get("YANTRESH_DEMO_RATE_PER_MIN", "6")))
+_MAX_RATE_ENTRIES = 10_000           # bounded in-memory rate table (Zero Bloat: no Redis)
 
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -115,7 +123,9 @@ class AppState:
 state = AppState()
 
 
-def _build_lane(cfg: Config, profile: str, bounds: Bounds, budget, tool_allowlist: tuple[str, ...], concurrency: int) -> Lane:
+def _build_lane(
+    cfg: Config, profile: str, bounds: Bounds, budget: BudgetCfg, tool_allowlist: tuple[str, ...], concurrency: int
+) -> Lane:
     ledger = Ledger(
         journal_path=budget.journal_path,
         fuse_path=budget.fuse_path,
@@ -156,6 +166,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Yantresh OS API", version="2.0.0", lifespan=lifespan)
 
+# Browser callers (e.g. the portfolio site hitting /v1/demo/missions from a
+# different origin) are opt-in via a comma-separated allowlist — empty (the
+# default) means no CORS headers are added at all.
+_cors_origins = [o.strip() for o in os.environ.get("YANTRESH_CORS_ORIGINS", "").split(",") if o.strip()]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_methods=["GET", "POST"],
+        allow_headers=["*"],
+    )
+
 
 # ---------------------------------------------------------------------------
 # Auth (Wall L0 — static token, constant-time compare; demo lane has none)
@@ -183,6 +205,32 @@ def _evict_if_full(records: dict[str, MissionRecord]) -> None:
 async def _reap(mission_dir: Path, delay: float) -> None:
     await asyncio.sleep(delay)
     shutil.rmtree(mission_dir, ignore_errors=True)
+
+
+# Fixed-window per-IP limiter for the public demo lane.
+_demo_rate: dict[str, tuple[float, int]] = {}
+
+
+def _check_demo_rate_limit(client_ip: str) -> None:
+    if DEMO_RATE_LIMIT_PER_MIN <= 0:
+        return
+    now = time.time()
+    window_start, count = _demo_rate.get(client_ip, (now, 0))
+    if now - window_start >= 60:
+        window_start, count = now, 0
+    count += 1
+    if count > DEMO_RATE_LIMIT_PER_MIN:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"demo rate limit exceeded ({DEMO_RATE_LIMIT_PER_MIN}/min) — try again later",
+        )
+    _demo_rate[client_ip] = (window_start, count)
+    if len(_demo_rate) > _MAX_RATE_ENTRIES:
+        # Bounded table: drop stale windows first; this only runs when the
+        # table is already large, so the scan cost is rare and self-limiting.
+        stale = [ip for ip, (ws, _) in _demo_rate.items() if now - ws >= 60]
+        for ip in stale:
+            del _demo_rate[ip]
 
 
 async def _run_mission(lane: Lane, mission_id: str, task: str) -> None:
@@ -309,9 +357,11 @@ async def get_mission(mission_id: str) -> MissionRecord:
     response_model=MissionAccepted,
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def create_demo_mission(req: DemoMissionRequest) -> MissionAccepted:
+async def create_demo_mission(req: DemoMissionRequest, request: Request) -> MissionAccepted:
     if state.demo is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="demo lane not configured")
+    client_ip = request.client.host if request.client else "unknown"
+    _check_demo_rate_limit(client_ip)
     return _accept(state.demo, req.task)
 
 
