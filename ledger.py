@@ -12,12 +12,59 @@ outside this codebase by design — see Crucible plan §A.3.
 from __future__ import annotations
 
 import json
+import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+from typing import IO, Iterator
 
 from bounds import Bounds, Escalate
+
+# ----------------------------------------------------------------------
+# Cross-platform advisory file lock for the fuse read-modify-write.
+#
+# Process-per-mission (Crucible §B.2) means N concurrent subprocesses can
+# call settle()/check_fuse() against the SAME .yantresh/fuse.json. Without
+# a lock, two read-modify-writes can interleave and lose an update — the
+# daily fuse would undercount spend, the one Cost Defense invariant this
+# whole file exists to uphold. fcntl (POSIX/containers) and msvcrt
+# (Windows dev) are both stdlib — no new dependency.
+# ----------------------------------------------------------------------
+if sys.platform == "win32":  # pragma: no cover - exercised on Windows dev only
+    import msvcrt
+
+    def _lock(fh: IO[bytes]) -> None:
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+
+    def _unlock(fh: IO[bytes]) -> None:
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+else:
+    import fcntl
+
+    def _lock(fh: IO[bytes]) -> None:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+
+    def _unlock(fh: IO[bytes]) -> None:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _file_lock(lock_path: Path) -> Iterator[None]:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as fh:
+        fh.seek(0, 2)
+        if fh.tell() == 0:
+            fh.write(b"0")
+            fh.flush()
+        _lock(fh)
+        try:
+            yield
+        finally:
+            _unlock(fh)
 
 
 @dataclass
@@ -38,6 +85,8 @@ class Ledger:
 
     def __post_init__(self) -> None:
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        self.fuse_path.parent.mkdir(parents=True, exist_ok=True)
+        self._fuse_lock_path = self.fuse_path.with_suffix(self.fuse_path.suffix + ".lock")
         self._replay_journal()
 
     # ---------------- fuse (operator kill switch) ----------------
@@ -61,12 +110,18 @@ class Ledger:
         tmp.replace(self.fuse_path)  # atomic on POSIX
 
     def check_fuse(self) -> None:
+        # Reads are lock-free: _write_fuse's tmp+replace is atomic, so a
+        # concurrent writer never produces a torn read — only the
+        # blow-the-fuse write below needs to serialize with settle().
         fuse = self._read_fuse()
         if fuse["state"] == "blown":
             raise Escalate("cost_fuse: fuse is blown — all spending halted")
         if fuse["spent_usd"] >= self.daily_max_usd:
-            fuse["state"] = "blown"
-            self._write_fuse(fuse)
+            with _file_lock(self._fuse_lock_path):
+                fuse = self._read_fuse()  # re-read under lock; another process may have already blown it
+                if fuse["state"] != "blown" and fuse["spent_usd"] >= self.daily_max_usd:
+                    fuse["state"] = "blown"
+                    self._write_fuse(fuse)
             raise Escalate(
                 f"cost_fuse: daily budget exhausted (${fuse['spent_usd']:.4f} >= ${self.daily_max_usd})"
             )
@@ -82,60 +137,4 @@ class Ledger:
     def remaining_usd(self, task_id: str) -> float:
         return max(self.bounds.max_usd - self.spend(task_id).usd, 0.0)
 
-    def preflight(self, task_id: str, model: str) -> None:
-        """Refuse dispatch when any wall would be breached; journal intent (WAL)."""
-        self.check_fuse()
-        if self.remaining_tokens(task_id) <= 0:
-            raise Escalate("token_budget: task token budget exhausted")
-        if self.remaining_usd(task_id) <= 0:
-            raise Escalate("cost_cap: task USD budget exhausted")
-        self._append({"kind": "intent", "ts": time.time(), "task": task_id, "model": model})
-
-    def settle(self, task_id: str, model: str, input_tokens: int, output_tokens: int, usd: float | None) -> float:
-        """Record actuals. Returns the USD charged (estimated if unknown)."""
-        tokens = input_tokens + output_tokens
-        if usd is None or usd <= 0:
-            usd = tokens / 1000 * self.fallback_usd_per_1k
-        spend = self.spend(task_id)
-        spend.tokens += tokens
-        spend.usd += usd
-        spend.calls += 1
-
-        fuse = self._read_fuse()
-        fuse["spent_usd"] = round(fuse["spent_usd"] + usd, 6)
-        self._write_fuse(fuse)
-
-        self._append(
-            {
-                "kind": "settle",
-                "ts": time.time(),
-                "task": task_id,
-                "model": model,
-                "in": input_tokens,
-                "out": output_tokens,
-                "usd": round(usd, 6),
-            }
-        )
-        return usd
-
-    # ---------------- journal ----------------
-
-    def _append(self, row: dict) -> None:
-        with self.journal_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row) + "\n")
-            fh.flush()
-
-    def _replay_journal(self) -> None:
-        """Crash-loop defense: restarts resume against money already spent."""
-        if not self.journal_path.is_file():
-            return
-        for line in self.journal_path.read_text(encoding="utf-8").splitlines():
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if row.get("kind") == "settle":
-                spend = self.spend(row["task"])
-                spend.tokens += int(row.get("in", 0)) + int(row.get("out", 0))
-                spend.usd += float(row.get("usd", 0.0))
-                spend.calls += 1
+    def preflight(self, task_id: str, model:
