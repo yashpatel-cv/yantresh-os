@@ -29,13 +29,12 @@ max_seconds = 600                # whole-run monotonic deadline
 max_tokens = 200000              # per task, all calls, clamped pre-flight
 max_usd = 0.50                   # Wall L1: per-task spend cap
 
-[budget]
-daily_max_usd = 5.00             # Wall L1: daily fuse — flip fuse.json to "blown" to halt all spend
-journal_path = ".yantresh/ledger.jsonl"
-fuse_path = ".yantresh/fuse.json"
-fallback_usd_per_1k_tokens = 0.0011   # cost estimate when litellm lacks a price entry
-
-[tools]
-workdir = "./workspace"          # the jail — nothing escapes it
-output_cap_chars = 4000          # context dieting: head+tail truncation
-bash_timeout_seconds = 20
+# --- demo lane (api.py /v1/demo/missions — public, unauthenticated) ---
+# Any field omitted here inherits the [bounds] value above. This profile
+# is selected with `--profile demo` (config.py: load_config(profile="demo")).
+[bounds.demo]
+max_plan_steps = 1               # one subtask, no replans possible by construction
+max_retries = 0
+max_replans = 0
+max_tool_iters = 1                # at most one tool call before forced verify/return
+max_se
