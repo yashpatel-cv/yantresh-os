@@ -32,9 +32,13 @@ def main() -> int:
     parser.add_argument("task", help="the task to execute")
     parser.add_argument("--config", default="yantresh.toml")
     parser.add_argument("--workdir", default=None, help="override the tool jail directory")
+    parser.add_argument(
+        "--profile", default="default", choices=("default", "demo"),
+        help="bounds/budget profile from yantresh.toml (default: 'default')",
+    )
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, profile=args.profile)
 
     missing = {
         hint
@@ -60,10 +64,4 @@ def main() -> int:
     )
 
     print(f"yantresh · worst-case LLM-call ceiling: {cfg.bounds.worst_case_llm_calls()}", file=sys.stderr)
-    report = Agent(cfg, ModelRouter(cfg, ledger), ledger).run(args.task)
-    print(json.dumps(asdict(report), indent=2))
-    return 0 if report.status == "complete" else 2
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    report = Agent(cfg
