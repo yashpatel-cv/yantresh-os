@@ -1,0 +1,41 @@
+# ============================================================
+# yantresh.toml — THE control panel.
+# Swapping vendors, retuning budgets, or adding a role is an
+# edit here, never a code change. (Crucible plan §B.1)
+# ============================================================
+
+[router]
+call_timeout_seconds = 60        # hard socket deadline per LLM call (Wall vs hung-socket attack)
+
+# --- model per step type; fallbacks tried in order, each attempt billed ---
+[models.amatya]                 # supervisor: plan / verify / replan
+model = "deepseek/deepseek-chat"
+fallbacks = []
+max_tokens = 2048
+temperature = 0.1
+
+[models.karta]                # worker: tool-calling execution
+model = "deepseek/deepseek-chat"
+fallbacks = []
+max_tokens = 1536
+temperature = 0.2
+
+[bounds]                         # the Five(+) Bounds — every axis terminal
+max_plan_steps = 8
+max_retries = 2                  # per subtask
+max_replans = 2                  # per task; duplicate plan == breach
+max_tool_iters = 6               # per subtask worker loop
+max_seconds = 600                # whole-run monotonic deadline
+max_tokens = 200000              # per task, all calls, clamped pre-flight
+max_usd = 0.50                   # Wall L1: per-task spend cap
+
+[budget]
+daily_max_usd = 5.00             # Wall L1: daily fuse — flip fuse.json to "blown" to halt all spend
+journal_path = ".yantresh/ledger.jsonl"
+fuse_path = ".yantresh/fuse.json"
+fallback_usd_per_1k_tokens = 0.0011   # cost estimate when litellm lacks a price entry
+
+[tools]
+workdir = "./workspace"          # the jail — nothing escapes it
+output_cap_chars = 4000          # context dieting: head+tail truncation
+bash_timeout_seconds = 20
