@@ -64,4 +64,10 @@ def main() -> int:
     )
 
     print(f"yantresh · worst-case LLM-call ceiling: {cfg.bounds.worst_case_llm_calls()}", file=sys.stderr)
-    report = Agent(cfg
+    report = Agent(cfg, ModelRouter(cfg, ledger), ledger).run(args.task)
+    print(json.dumps(asdict(report), indent=2))
+    return 0 if report.status == "complete" else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -97,4 +97,59 @@ def _build_budget(raw: dict, base: Path, fallback: BudgetCfg | None = None) -> B
 
 def load_config(path: str | Path = "yantresh.toml", profile: str = "default") -> Config:
     path = Path(path)
-    i
+    if not path.is_file():
+        raise FileNotFoundError(f"config not found: {path}")
+    with path.open("rb") as fh:
+        raw = tomllib.load(fh)
+
+    routes: dict[str, ModelRoute] = {}
+    for role, spec in raw.get("models", {}).items():
+        routes[role] = ModelRoute(
+            model=spec["model"],
+            fallbacks=tuple(spec.get("fallbacks", [])),
+            max_tokens=int(spec.get("max_tokens", 2048)),
+            temperature=float(spec.get("temperature", 0.2)),
+        )
+    if not routes:
+        raise ValueError("yantresh.toml: at least one [models.<role>] is required")
+
+    base = path.parent
+
+    b = raw.get("bounds", {})
+    bounds = _build_bounds(b)
+
+    bud = raw.get("budget", {})
+    budget = _build_budget(bud, base)
+
+    t = raw.get("tools", {})
+    tools = ToolsCfg(
+        workdir=(base / t.get("workdir", "./workspace")).resolve(),
+        output_cap_chars=int(t.get("output_cap_chars", 4000)),
+        bash_timeout_seconds=int(t.get("bash_timeout_seconds", 20)),
+    )
+
+    demo: DemoCfg | None = None
+    demo_b, demo_bud, demo_t = b.get("demo"), bud.get("demo"), t.get("demo")
+    if demo_b is not None or demo_bud is not None or demo_t is not None:
+        demo = DemoCfg(
+            bounds=_build_bounds(demo_b or {}, fallback=bounds),
+            budget=_build_budget(demo_bud or {}, base, fallback=budget),
+            allowed_tools=tuple((demo_t or {}).get("allowed", [])),
+        )
+
+    if profile == "demo":
+        if demo is None:
+            raise ValueError("yantresh.toml: profile='demo' requested but no [bounds.demo]/[budget.demo] defined")
+        bounds, budget = demo.bounds, demo.budget
+    elif profile != "default":
+        raise ValueError(f"unknown config profile: {profile!r}")
+
+    return Config(
+        routes=routes,
+        bounds=bounds,
+        budget=budget,
+        tools=tools,
+        call_timeout_seconds=float(raw.get("router", {}).get("call_timeout_seconds", 60)),
+        roles_dir=base / "roles",
+        demo=demo,
+    )

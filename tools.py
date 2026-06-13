@@ -171,4 +171,29 @@ def read_file(path: str) -> str:
 def write_file(path: str, content: str) -> str:
     """Write UTF-8 text to a file in the workspace, creating parent dirs."""
     target = _jail(path)
-    target.parent.m
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return f"wrote {len(content)} chars to {path}"
+
+
+@tool
+def run_bash(command: str) -> str:
+    """Run a shell command inside the workspace (20s timeout, no network)."""
+    for pattern in _BASH_BLOCKLIST:
+        if pattern.search(command):
+            raise ToolError(f"command blocked by security policy: {command!r}")
+    if _WORKDIR is None:
+        raise ToolError("tools not configured")
+    try:
+        proc = subprocess.run(
+            command,
+            shell=True,
+            cwd=_WORKDIR,
+            capture_output=True,
+            text=True,
+            timeout=_BASH_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ToolError(f"command timed out after {_BASH_TIMEOUT}s") from exc
+    output = (proc.stdout or "") + (("\n[stderr]\n" + proc.stderr) if proc.stderr else "")
+    return f"[exit {proc.returncode}]\n{output.strip() or '(no output)'}"

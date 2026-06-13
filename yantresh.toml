@@ -33,8 +33,35 @@ max_usd = 0.50                   # Wall L1: per-task spend cap
 # Any field omitted here inherits the [bounds] value above. This profile
 # is selected with `--profile demo` (config.py: load_config(profile="demo")).
 [bounds.demo]
-max_plan_steps = 1               # one subtask, no replans possible by construction
+max_plan_steps = 1               # one subtask, no replans possible by construct
 max_retries = 0
 max_replans = 0
 max_tool_iters = 1                # at most one tool call before forced verify/return
-max_se
+max_seconds = 25                  # short enough Caddy's own timeouts never bite
+max_tokens = 4000
+max_usd = 0.02                    # worst case ~25 demo runs per budget.demo.daily_max_usd
+
+[budget]
+daily_max_usd = 5.00             # Wall L1: daily fuse — flip fuse.json to "blown" to halt all spend
+journal_path = ".yantresh/ledger.jsonl"
+fuse_path = ".yantresh/fuse.json"
+fallback_usd_per_1k_tokens = 0.0011   # cost estimate when litellm lacks a price entry
+
+# Separate journal + fuse: public demo traffic can never starve the
+# private-lane daily budget (and vice versa). Inherits fallback rate above.
+[budget.demo]
+daily_max_usd = 0.50
+journal_path = ".yantresh/demo-ledger.jsonl"
+fuse_path = ".yantresh/demo-fuse.json"
+
+[tools]
+workdir = "./workspace"          # the jail — nothing escapes it
+output_cap_chars = 4000          # context dieting: head+tail truncation
+bash_timeout_seconds = 20
+
+# Capability fence for the demo lane (tools.py YANTRESH_TOOL_ALLOWLIST).
+# run_bash and write_file are deliberately excluded — a public,
+# unauthenticated caller gets a read-only peek at Karta's reasoning,
+# never shell access or filesystem writes.
+[tools.demo]
+allowed = ["read_file"]

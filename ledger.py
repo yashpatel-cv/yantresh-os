@@ -137,4 +137,66 @@ class Ledger:
     def remaining_usd(self, task_id: str) -> float:
         return max(self.bounds.max_usd - self.spend(task_id).usd, 0.0)
 
-    def preflight(self, task_id: str, model:
+    def preflight(self, task_id: str, model: str) -> None:
+        """Refuse dispatch when any wall would be breached; journal intent (WAL)."""
+        self.check_fuse()
+        if self.remaining_tokens(task_id) <= 0:
+            raise Escalate("token_budget: task token budget exhausted")
+        if self.remaining_usd(task_id) <= 0:
+            raise Escalate("cost_cap: task USD budget exhausted")
+        self._append({"kind": "intent", "ts": time.time(), "task": task_id, "model": model})
+
+    def settle(self, task_id: str, model: str, input_tokens: int, output_tokens: int, usd: float | None) -> float:
+        """Record actuals. Returns the USD charged (estimated if unknown)."""
+        tokens = input_tokens + output_tokens
+        if usd is None or usd <= 0:
+            usd = tokens / 1000 * self.fallback_usd_per_1k
+        spend = self.spend(task_id)
+        spend.tokens += tokens
+        spend.usd += usd
+        spend.calls += 1
+
+        # The read-modify-write across processes — this is the critical
+        # section. settle() is called once per LLM call, not per-token,
+        # so lock contention is negligible at this concurrency scale.
+        with _file_lock(self._fuse_lock_path):
+            fuse = self._read_fuse()
+            fuse["spent_usd"] = round(fuse["spent_usd"] + usd, 6)
+            if fuse["spent_usd"] >= self.daily_max_usd:
+                fuse["state"] = "blown"
+            self._write_fuse(fuse)
+
+        self._append(
+            {
+                "kind": "settle",
+                "ts": time.time(),
+                "task": task_id,
+                "model": model,
+                "in": input_tokens,
+                "out": output_tokens,
+                "usd": round(usd, 6),
+            }
+        )
+        return usd
+
+    # ---------------- journal ----------------
+
+    def _append(self, row: dict) -> None:
+        with self.journal_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+            fh.flush()
+
+    def _replay_journal(self) -> None:
+        """Crash-loop defense: restarts resume against money already spent."""
+        if not self.journal_path.is_file():
+            return
+        for line in self.journal_path.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("kind") == "settle":
+                spend = self.spend(row["task"])
+                spend.tokens += int(row.get("in", 0)) + int(row.get("out", 0))
+                spend.usd += float(row.get("usd", 0.0))
+                spend.calls += 1

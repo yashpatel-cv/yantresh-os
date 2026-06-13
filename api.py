@@ -202,4 +202,121 @@ async def _run_mission(lane: Lane, mission_id: str, task: str) -> None:
         sys.executable, str(APP_DIR / "cli.py"),
         "--config", CONFIG_PATH,
         "--profile", lane.profile,
-        "-
+        "--workdir", str(mission_dir),
+        task,
+    ]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv, cwd=APP_DIR, env=env,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=lane.bounds.max_seconds + SUBPROCESS_GRACE_SECONDS
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            record.status = "error"
+            record.error = "subprocess_timeout: mission exceeded bounds.max_seconds + grace and was killed"
+            return
+
+        if proc.returncode == 1:
+            record.status = "error"
+            record.error = f"cli_error: {stderr.decode(errors='replace').strip()[:500]}"
+            return
+
+        try:
+            report = json.loads(stdout.decode())
+        except json.JSONDecodeError:
+            record.status = "error"
+            record.error = f"unparseable_report: {stdout.decode(errors='replace')[:500]}"
+            return
+
+        record.report = report
+        record.status = report.get("status", "error")  # "complete" | "escalated"
+
+    except Exception as exc:  # noqa: BLE001 — last-resort containment; never crash the API process
+        record.status = "error"
+        record.error = f"{type(exc).__name__}: {exc}"
+    finally:
+        asyncio.create_task(_reap(mission_dir, MISSION_TTL_SECONDS))
+
+
+async def _dispatch(lane: Lane, mission_id: str, task: str) -> None:
+    async with lane.sem:
+        await _run_mission(lane, mission_id, task)
+
+
+def _accept(lane: Lane, task: str) -> MissionAccepted:
+    # Wall L1, checked synchronously, BEFORE any subprocess is spawned.
+    # check_fuse() is a local fuse.json read — zero network I/O, the
+    # model is never woken if this lane's fuse is blown.
+    try:
+        lane.ledger.check_fuse()
+    except Escalate as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
+
+    _evict_if_full(lane.records)
+
+    mission_id = uuid.uuid4().hex[:16]
+    lane.records[mission_id] = MissionRecord(mission_id=mission_id, status="queued", submitted_at=time.time())
+    asyncio.create_task(_dispatch(lane, mission_id, task))
+    return MissionAccepted(mission_id=mission_id, status="queued")
+
+
+def _get(lane: Lane, mission_id: str) -> MissionRecord:
+    record = lane.records.get(mission_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="unknown mission_id")
+    return record
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/healthz")
+async def healthz() -> dict[str, str]:
+    """Pure liveness probe. Touches neither lane's ledger nor any model —
+    a blown fuse is a healthy, correctly-operating state and must never
+    fail a container healthcheck."""
+    return {"status": "ok"}
+
+
+@app.post(
+    "/v1/missions",
+    response_model=MissionAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(verify_api_key)],
+)
+async def create_mission(req: MissionRequest) -> MissionAccepted:
+    return _accept(state.private, req.task)
+
+
+@app.get(
+    "/v1/missions/{mission_id}",
+    response_model=MissionRecord,
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_mission(mission_id: str) -> MissionRecord:
+    return _get(state.private, mission_id)
+
+
+@app.post(
+    "/v1/demo/missions",
+    response_model=MissionAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def create_demo_mission(req: DemoMissionRequest) -> MissionAccepted:
+    if state.demo is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="demo lane not configured")
+    return _accept(state.demo, req.task)
+
+
+@app.get("/v1/demo/missions/{mission_id}", response_model=MissionRecord)
+async def get_demo_mission(mission_id: str) -> MissionRecord:
+    if state.demo is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="demo lane not configured")
+    return _get(state.demo, mission_id)
