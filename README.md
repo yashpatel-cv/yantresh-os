@@ -1,5 +1,9 @@
 # Yantresh — Phase 0 spine
 
+> **AI agents:** read [`CLAUDE.md`](CLAUDE.md) before making any edit. It is
+> the mandatory rules file (minimalism, no hardcoded secrets, atomic commits,
+> LF endings) and applies to every change.
+
 The bounded 1 Supervisor (Amatya) + 1 Worker (Karta) loop from the
 [Crucible plan](Yantresh-CRUCIBLE-PLAN.md). ~1,100 LOC, 9 modules, flat.
 Termination is enforced by a runtime ranking-function proof (`bounds.py`),
