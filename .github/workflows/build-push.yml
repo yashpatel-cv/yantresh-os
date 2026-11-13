@@ -1,9 +1,9 @@
 name: build-push
 
-# Builds the api.py seam image natively for arm64 (and amd64) and pushes
-# to GHCR. The Ampere A1 VPS only ever runs `docker compose pull` — it
-# never builds. Mirror this workflow in the patel-portfolio repo with
-# image name `patel-portfolio`.
+# Builds the api.py seam image natively on an arm64 runner (the VPS is
+# arm64-only), scans it, and only then pushes to GHCR. The Ampere A1 VPS
+# only ever runs `docker compose pull` — it never builds. patel-portfolio
+# mirrors this workflow.
 
 on:
   push:
@@ -14,6 +14,10 @@ on:
 permissions:
   contents: read
   packages: write
+
+concurrency:
+  group: build-push-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -31,13 +35,28 @@ jobs:
 
   build:
     needs: test
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3 — emulation only for cross-build on x86 runners
-
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          load: true
+          tags: yantresh-os:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Gate the push: fail on fixable HIGH/CRITICAL CVEs before anything ships.
+      - name: Scan image (Trivy)
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          image-ref: yantresh-os:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
 
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -54,22 +73,11 @@ jobs:
             type=semver,pattern={{version}}
             type=sha,prefix=
 
-      - id: build
+      - name: Push
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
-          platforms: linux/arm64,linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      # Scan the pushed image by digest; fail on fixable HIGH/CRITICAL CVEs.
-      - name: Scan image (Trivy)
-        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
-        with:
-          image-ref: ghcr.io/${{ github.repository_owner }}/yantresh-os@${{ steps.build.outputs.digest }}
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          exit-code: "1"
