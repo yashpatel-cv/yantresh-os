@@ -13,13 +13,17 @@ ENV PATH="/opt/venv/bin:${PATH}"
 
 COPY requirements-api.txt requirements.txt ./
 RUN pip install --no-cache-dir --upgrade pip \
- && pip install --no-cache-dir -r requirements-api.txt
+ && pip install --no-cache-dir -r requirements-api.txt \
+ && pip uninstall -y pip   # read-only runtime never installs; drops pip's vendored-deps CVE noise
 
 
 FROM python:3.12-slim AS runtime
 
 LABEL org.opencontainers.image.title="yantresh-os" \
       org.opencontainers.image.description="Amatya/Karta orchestrator — FastAPI seam"
+
+# Base image lags Debian security fixes; patch at build so the CI CVE gate passes.
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
 
 # Fixed UID/GID so the host can chown bind mounts predictably.
 RUN groupadd --gid 1000 yantresh \
